@@ -1,0 +1,4 @@
+# Official upstream release, downloaded and hashed on 2026-11-13.
+FFMPEG_VERSION=7.1.1
+FFMPEG_URL=https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz
+FFMPEG_SHA256=733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1

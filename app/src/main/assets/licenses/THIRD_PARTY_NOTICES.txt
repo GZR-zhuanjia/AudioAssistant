@@ -1,0 +1,21 @@
+Audio Assistant / 音频助手
+
+This software uses libraries from the FFmpeg project (https://ffmpeg.org/).
+FFmpeg 7.1.1, copyright (c) the FFmpeg developers and contributors.
+These shared libraries are built with GPL, nonfree and version3 disabled,
+and are distributed under the GNU Lesser General Public License 2.1 or later.
+
+The complete LGPL 2.1 text is FFmpeg-LGPL-2.1.txt in this directory.
+Upstream component licensing is described in FFmpeg-LICENSE.md.
+Source archive: https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz
+SHA-256: 733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1
+The corresponding source, build script and configuration records must accompany
+each binary release as described in docs/FFMPEG_LICENSES.md in the app source.
+
+Recipients may replace the FFmpeg shared libraries and rebuild and sign this
+application from its source. Reverse engineering needed to debug modifications
+to the LGPL libraries is permitted. FFmpeg is provided without warranty.
+
+This application also uses AndroidX/Jetpack Compose/Media3, Kotlin and kotlinx
+libraries under their respective Apache License 2.0 terms. Their source and
+license metadata are available from Google's Maven repository and Maven Central.
