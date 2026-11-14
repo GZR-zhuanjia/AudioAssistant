@@ -53,6 +53,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.audioassistant.data.WaveformData
+import com.audioassistant.domain.AudioNames
 import com.audioassistant.domain.SegmentEditor
 import com.audioassistant.domain.SongItem
 import java.io.File
@@ -83,21 +84,43 @@ fun AudioAssistantApp(vm: AudioViewModel) {
         else reorder.cancelIfChanged(songIds)
     }
     DisposableEffect(reorder) { onDispose { reorder.cancel() } }
-    var pendingSavePath by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingFolderToken by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingFolderItemId by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingFolderName by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingFolderAutomatic by rememberSaveable { mutableStateOf(false) }
     val audioPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments(), vm::importAudio)
     val videoPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments(), vm::importVideos)
     // Android Photo Picker grants access only to the selected videos. The same
     // repository import immediately snapshots their content:// streams offline.
     val galleryPicker = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(), vm::importVideos)
-    val saveResult: (android.net.Uri?) -> Unit = { uri ->
-        val file = pendingSavePath?.let(::File); pendingSavePath = null
-        if (uri != null && file != null) vm.saveOutput(file, uri)
+    val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { folder ->
+        val token = pendingFolderToken
+        val itemId = pendingFolderItemId
+        val name = pendingFolderName
+        val automatic = pendingFolderAutomatic
+        pendingFolderToken = null; pendingFolderItemId = null; pendingFolderName = null; pendingFolderAutomatic = false
+        if (token != null && itemId != null && name != null) {
+            if (folder == null) vm.skipResultSave(token)
+            else vm.saveResultToFolder(token, itemId, name, folder, automatic)
+        }
     }
-    val saveMp3Picker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("audio/mpeg"), saveResult)
-    val saveM4aPicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("audio/mp4"), saveResult)
-    val saveAs: (File) -> Unit = { file ->
-        pendingSavePath = file.absolutePath
-        if (vm.outputMimeType(file) == "audio/mpeg") saveMp3Picker.launch(file.name) else saveM4aPicker.launch(file.name)
+    val saveAs: (File) -> Unit = vm::requestResultSave
+    val saveOffer = state.saveOffers.firstOrNull()
+    LaunchedEffect(saveOffer?.token, saveOffer?.awaitingFolder, state.busy, pendingFolderItemId) {
+        if (saveOffer != null && saveOffer.awaitingFolder && state.busy == null && pendingFolderItemId == null) {
+            // Keep stable library identity before launching; file paths and a live VM
+            // are unnecessary if Android recreates this activity during selection.
+            pendingFolderToken = saveOffer.token
+            pendingFolderItemId = saveOffer.libraryId
+            pendingFolderName = saveOffer.name
+            pendingFolderAutomatic = saveOffer.automatic
+            vm.folderPickerLaunched(saveOffer.token)
+            try { folderPicker.launch(vm.lastSaveFolder()) }
+            catch (e: Exception) {
+                pendingFolderToken = null; pendingFolderItemId = null; pendingFolderName = null; pendingFolderAutomatic = false
+                vm.folderPickerFailed(saveOffer.token, "无法打开保存位置，请重试：${e.message}")
+            }
+        }
     }
     var shareError by remember { mutableStateOf<String?>(null) }
     val share: (File) -> Unit = { file ->
@@ -159,7 +182,7 @@ fun AudioAssistantApp(vm: AudioViewModel) {
                 if (module == "video") {
                     item { Section {
                         Text("视频音轨提取", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                        Text("从相册或文件中选择视频，逐个命名并转换为 MP3。支持多选，结果自动存入素材库，可保存、分享或手动加入拼接。", style = MaterialTheme.typography.bodyMedium)
+                        Text("从相册或文件中选择视频，转换完成后给成果起名，再选择保存位置。支持多选，转换成果同时保留在应用成果库中。", style = MaterialTheme.typography.bodyMedium)
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Button(onClick = {
                                 try { galleryPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)) }
@@ -171,17 +194,16 @@ fun AudioAssistantApp(vm: AudioViewModel) {
                         if (state.videos.isEmpty()) EmptyHint("尚未导入视频", "相册仅显示视频；也可从文件选择器浏览录屏、下载目录和其他文档来源")
                     } }
                     itemsIndexed(state.videos, key = { _, row -> row.input.id }) { index, row -> Section {
-                        Text("${index + 1}. ${row.input.displayName}", fontWeight = FontWeight.SemiBold)
-                        OutlinedTextField(value = row.outputName, onValueChange = { vm.videoName(row.input.id, it) }, modifier = Modifier.fillMaxWidth(), label = { Text("输出文件名") }, suffix = { Text(".mp3") }, singleLine = true, enabled = state.busy == null)
+                        Text("${index + 1}. ${AudioNames.suggested(row.input.displayName)}", fontWeight = FontWeight.SemiBold)
                         if (state.activeVideoId == row.input.id) {
                             LinearProgressIndicator(progress = { row.progress.toFloat().coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
                             TextButton(onClick = vm::cancel) { Text("取消当前提取") }
                         }
                         if (row.output == null) Button(onClick = { vm.extract(row.input.id) }, enabled = state.busy == null && row.outputName.isNotBlank()) { Text("提取音轨") }
                         else {
-                            Text("MP3 已转换并存入素材库", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelLarge)
+                            Text("转换成果已保留在成果库", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelLarge)
                             Button(onClick = { vm.addConvertedOutput(row.output) { module = "edit" } }, enabled = state.ready && !state.loadFailed && state.busy == null) { Text("添加到拼接 / 前往剪辑") }
-                            OutputActions(row.output, state.busy == null, saveAs, share, vm::saveToMusic, playOutput)
+                            OutputActions(row.output, state.busy == null, saveAs, share, playOutput)
                         }
                     } }
                 } else {
@@ -191,7 +213,7 @@ fun AudioAssistantApp(vm: AudioViewModel) {
                             Text("${state.project.songs.size} 首 · 保留 ${timeText(state.project.songs.sumOf { SegmentEditor.editedDurationUs(it.segments) })}", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
                             Button(onClick = { audioPicker.launch(arrayOf("audio/*")) }, enabled = state.ready && !state.loadFailed && state.busy == null && !reorder.isDragging) { Text("＋ 添加歌曲") }
                         }
-                        OutlinedButton(onClick = { vm.refreshLibrary(); libraryOpen = true }, enabled = state.ready && !state.loadFailed && state.busy == null && !reorder.isDragging) { Text("从素材库添加") }
+                        OutlinedButton(onClick = { vm.refreshLibrary(); libraryOpen = true }, enabled = state.ready && !state.loadFailed && state.busy == null && !reorder.isDragging) { Text("从成果库添加") }
                         Text(state.saveStatus, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         if (state.project.songs.size > 1) Text("长按歌曲左侧 ≡ 上下拖动排序，松手后保存；也可使用上移、下移。", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         if (state.project.songs.isEmpty()) EmptyHint("从第一首歌开始", "批量选择歌曲后，调整顺序、删掉片段，再导出一段完整舞曲")
@@ -212,6 +234,11 @@ fun AudioAssistantApp(vm: AudioViewModel) {
             }
         }
         if (libraryOpen) AudioLibraryDialog(state, vm, dismiss = { libraryOpen = false }, added = { libraryOpen = false; module = "edit" })
+        if (saveOffer != null && !saveOffer.awaitingFolder && pendingFolderItemId == null && (state.busy == null || state.busy == "正在保存成果名称")) {
+            ResultNameDialog(key = saveOffer.token, title = "给成果起个名字", initialName = saveOffer.name, error = saveOffer.error,
+                busy = state.busy != null, confirmLabel = "下一步：选位置", dismissLabel = "稍后命名/保存",
+                confirm = { vm.confirmResultName(saveOffer.token, it) }, dismiss = { vm.skipResultSave(saveOffer.token) })
+        }
     }
 }
 
@@ -250,7 +277,7 @@ private fun SongRow(song: SongItem, waveform: WaveformData?, index: Int, total: 
                 SongDragHandle(song.id, song.source.displayName, reorder, songIds, enabled && total > 1)
                 Text("${index + 1}".padStart(2, '0'), Modifier.padding(end = 12.dp), color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                 Column(Modifier.weight(1f)) {
-                    Text(song.source.displayName, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(AudioNames.suggested(song.source.displayName), fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Text("原长 ${timeText(song.source.durationUs)} → 保留 ${timeText(SegmentEditor.editedDurationUs(song.segments))} · ${song.segments.size} 段", style = MaterialTheme.typography.labelSmall)
                 }
                 TextButton(onClick = { vm.selectSong(song.id) }, enabled = actionsEnabled) { Text(if (selected) "编辑中" else "编辑") }
@@ -292,7 +319,7 @@ private fun TrimEditor(state: EditorState, song: SongItem, vm: AudioViewModel) {
     val viewport = (duration / state.zoom).toLong().coerceAtLeast(1)
     Section {
         Text("精确裁剪", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-        Text(song.source.displayName, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(AudioNames.suggested(song.source.displayName), style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
         Row(horizontalArrangement = Arrangement.spacedBy(18.dp)) { Legend("保留", Kept); Legend("已删除", Cut); Legend("选区", Selection) }
         if (state.waveformLoading) { LinearProgressIndicator(Modifier.fillMaxWidth()); Text("正在分析真实波形，较长音频需要一些时间…", style = MaterialTheme.typography.labelSmall) }
         if (state.waveformError != null) Row(verticalAlignment = Alignment.CenterVertically) {
@@ -448,15 +475,14 @@ private fun ExportPanel(state: EditorState, vm: AudioViewModel, saveAs: (File) -
         Button(onClick = vm::export, enabled = state.busy == null && state.project.title.isNotBlank() && state.project.songs.all { it.segments.isNotEmpty() }, modifier = Modifier.weight(1f)) { Text("导出舞曲") }
     }
     if (state.project.songs.any { it.segments.isEmpty() }) Text("有歌曲未保留任何片段，请恢复片段或移除该曲后导出。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
-    state.exportOutput?.let { file -> Text("已生成 ${file.name}", style = MaterialTheme.typography.labelMedium, color = Accent); OutputActions(file, state.busy == null, saveAs, share, vm::saveToMusic, playOutput) }
+    state.exportOutput?.let { file -> Text("拼接成果已存入成果库", style = MaterialTheme.typography.labelMedium, color = Accent); OutputActions(file, state.busy == null, saveAs, share, playOutput) }
 }
 
 @Composable
-private fun OutputActions(file: File, enabled: Boolean, saveAs: (File) -> Unit, share: (File) -> Unit, music: (File) -> Unit, play: (File) -> Unit) {
+private fun OutputActions(file: File, enabled: Boolean, saveAs: (File) -> Unit, share: (File) -> Unit, play: (File) -> Unit) {
     TextButton(onClick = { play(file) }, enabled = enabled) { Text("播放导出音频") }
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        OutlinedButton(onClick = { saveAs(file) }, enabled = enabled, modifier = Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 8.dp)) { Text("另存为") }
-        OutlinedButton(onClick = { music(file) }, enabled = enabled, modifier = Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 8.dp)) { Text("存音乐库") }
+        OutlinedButton(onClick = { saveAs(file) }, enabled = enabled, modifier = Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 8.dp)) { Text("保存到…") }
         Button(onClick = { share(file) }, enabled = enabled, modifier = Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 8.dp)) { Text("分享") }
     }
 }

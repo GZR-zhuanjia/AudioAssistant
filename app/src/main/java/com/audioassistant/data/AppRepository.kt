@@ -6,11 +6,13 @@ import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.provider.DocumentsContract
 import android.util.AtomicFile
 import androidx.core.content.FileProvider
 import com.audioassistant.domain.AudioProject
 import com.audioassistant.domain.AudioSegment
 import com.audioassistant.domain.AudioLibraryItem
+import com.audioassistant.domain.AudioNames
 import com.audioassistant.domain.LibraryOrigin
 import com.audioassistant.domain.SongItem
 import com.audioassistant.domain.SourceAudio
@@ -35,6 +37,11 @@ import java.util.Locale
 import kotlin.math.max
 
 data class VideoInput(val id: String, val displayName: String, val localPath: String)
+
+/** The external copy succeeded; callers must not offer it as a failed copy to retry. */
+class SavedResultRecordException(val savedUri: Uri, cause: Throwable) : IOException(
+    "文件已经保存，但保存记录或最近位置的更新遇到问题，无需重新保存。", cause,
+)
 
 /** Base level is one maximum across channels per 1024 decoded samples. Higher levels
  * halve the number of bins; gesture redraws never invoke the decoder. */
@@ -113,7 +120,6 @@ class AppRepository(context: Context) : AutoCloseable {
             durationUs = metadata.durationUs, fingerprint = staged.digest,
             sampleRate = metadata.sampleRate, channels = metadata.channels
         )
-        registerLibrarySource(source, LibraryOrigin.AUDIO_IMPORT)
         SongItem(UUID.randomUUID().toString(), source, listOf(AudioSegment(0, source.durationUs)))
     }
 
@@ -123,6 +129,7 @@ class AppRepository(context: Context) : AutoCloseable {
         libraryMutex.withLock {
             migrateLegacyOutputs()
             library.list().also { entries -> entries.forEach(::validateLibraryIdentity) }
+                .filter { it.origin != LibraryOrigin.AUDIO_IMPORT }
         }
     }
 
@@ -144,6 +151,96 @@ class AppRepository(context: Context) : AutoCloseable {
         // Keep audio bytes: an existing project may still reference this source.
     }
 
+    suspend fun libraryItem(id: String): AudioLibraryItem = listLibrary().firstOrNull { it.id == id }
+        ?: throw IOException("此成果已从库中移除，请重新选择")
+
+    suspend fun renameLibraryItem(id: String, name: String): AudioLibraryItem = withContext(Dispatchers.IO) {
+        val base = AudioNames.validate(name)
+        libraryMutex.withLock {
+            val current = library.list().firstOrNull { it.id == id && it.origin != LibraryOrigin.AUDIO_IMPORT }
+                ?: throw IOException("此成果已从库中移除，请重新选择")
+            validateLibraryIdentity(current)
+            val renamed = current.copy(source = current.source.copy(displayName = base))
+            library.put(renamed)
+            renamed
+        }
+    }
+
+    fun lastSaveFolder(): Uri? = context.getSharedPreferences("audio-output", Context.MODE_PRIVATE)
+        .getString("last-folder", null)?.let { value -> runCatching {
+            val tree = Uri.parse(value)
+            DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree))
+        }.getOrNull() }
+
+    /** A folder picker never asks the user to edit a filename extension. The app
+     * supplies it from the real result type and creates a new, non-overwriting copy. */
+    suspend fun saveLibraryItemToFolder(id: String, name: String, treeUri: Uri, onCopyComplete: (Uri) -> Unit = {}): Uri = withContext(Dispatchers.IO) {
+        val base = AudioNames.validate(name)
+        require(treeUri.scheme == "content" && DocumentsContract.isTreeUri(treeUri)) { "请选择一个可保存的文件夹" }
+        val item = libraryItem(id)
+        validateSource(item.source)
+        val source = File(item.source.localPath)
+        val extension = source.extension.lowercase(Locale.ROOT)
+        require(extension in setOf("mp3", "m4a")) { "此成果的文件类型暂不支持保存，请重新生成成果" }
+        val resolver = context.contentResolver
+        try { resolver.takePersistableUriPermission(treeUri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION) }
+        catch (_: SecurityException) { /* The current picker grant can still allow this save. */ }
+        val parentId = DocumentsContract.getTreeDocumentId(treeUri)
+        val parent = DocumentsContract.buildDocumentUriUsingTree(treeUri, parentId)
+        val children = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentId)
+        val occupied = try {
+            resolver.query(children, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)?.use { cursor ->
+                buildSet {
+                    while (cursor.moveToNext()) {
+                        currentCoroutineContext().ensureActive()
+                        cursor.getString(0)?.let { add(it.lowercase(Locale.ROOT)) }
+                    }
+                }
+            } ?: throw IOException("无法读取所选文件夹，请重新选择")
+        } catch (error: SecurityException) { throw IOException("没有此文件夹的访问权限，请重新选择保存位置", error) }
+        var destinationName = "$base.$extension"
+        var suffixNumber = 2
+        while (destinationName.lowercase(Locale.ROOT) in occupied) {
+            destinationName = "$base（${suffixNumber++}）.$extension"
+            require(suffixNumber <= 10_000) { "此文件夹中的同名文件过多，请换一个名称或位置" }
+        }
+        val destination = DocumentsContract.createDocument(resolver, parent, outputMimeType(source), destinationName)
+            ?: throw IOException("无法在此文件夹保存，请选择其他位置")
+        var copied = false
+        try {
+            saveOutput(source, destination)
+            copied = true
+            // Notify before a dispatcher handoff can deliver a late cancellation.
+            // The ViewModel can then finish this offer instead of retrying a copy
+            // that already exists. This callback runs on the IO worker.
+            onCopyComplete(destination)
+            val folderName = runCatching {
+                resolver.query(parent, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)?.use {
+                    if (it.moveToFirst()) it.getString(0) else null
+                }
+            }.getOrNull()
+            withContext(NonCancellable) {
+                libraryMutex.withLock {
+                    val current = library.list().firstOrNull { it.id == id }
+                        ?: throw IOException("成果库记录已移除，音频仍保留在应用中")
+                    validateLibraryIdentity(current)
+                    library.put(current.copy(source = current.source.copy(displayName = base), lastSavedUri = destination.toString(),
+                        lastSavedAtMs = System.currentTimeMillis(), lastSavedFolderName = folderName))
+                }
+                context.getSharedPreferences("audio-output", Context.MODE_PRIVATE).edit().putString("last-folder", treeUri.toString()).apply()
+            }
+            destination
+        } catch (error: Throwable) {
+            if (!copied) withContext(NonCancellable) {
+                runCatching { DocumentsContract.deleteDocument(resolver, destination) }
+            }
+            if (copied && error !is CancellationException) {
+                throw SavedResultRecordException(destination, error)
+            }
+            throw error
+        }
+    }
+
     suspend fun libraryItemForFile(file: File): AudioLibraryItem? = withContext(Dispatchers.IO) {
         requirePrivateAudio(file)
         val entries = listLibrary()
@@ -163,6 +260,11 @@ class AppRepository(context: Context) : AutoCloseable {
             if (existing != null && File(existing.source.localPath).isFile) {
                 validateLibraryIdentity(existing)
                 requirePrivateAudio(File(existing.source.localPath))
+                if (existing.origin == LibraryOrigin.AUDIO_IMPORT || existing.origin == LibraryOrigin.LEGACY_OUTPUT) {
+                    val upgraded = existing.copy(source = source, origin = origin)
+                    library.put(upgraded)
+                    return@withLock upgraded
+                }
                 return@withLock existing
             }
             val item = AudioLibraryItem(source.fingerprint, source, System.currentTimeMillis(), origin)
@@ -346,7 +448,7 @@ class AppRepository(context: Context) : AutoCloseable {
                 // library record exists, late coroutine cancellation must never
                 // delete its audio and leave a persistent dangling reference.
                 withContext(NonCancellable) {
-                    val source = outputSource(output, "${outputBase(outputName)}.mp3")
+                    val source = outputSource(output, AudioNames.suggested(outputName))
                     registerLibrarySource(source, LibraryOrigin.VIDEO_CONVERSION)
                     indexed = true
                 }
@@ -363,13 +465,21 @@ class AppRepository(context: Context) : AutoCloseable {
             validateSource(song.source)
             require(song.segments.isNotEmpty()) { "${song.source.displayName} 没有保留片段" }
         }
-        createOutput(project.title) { engine.export(project, it.absolutePath, loudnessDir.absolutePath, onProgress) }
-    }
-
-    private suspend fun createOutput(name: String, process: suspend (File) -> Unit): File {
-        val output = newOutput(name, "m4a")
-        try { process(output); return output }
-        catch (e: Throwable) { output.delete(); throw e }
+        val output = newOutput(project.title, "m4a")
+        var indexed = false
+        try {
+            engine.export(project, output.absolutePath, loudnessDir.absolutePath, onProgress)
+            currentCoroutineContext().ensureActive()
+            withContext(NonCancellable) {
+                val source = outputSource(output, AudioNames.suggested(project.title))
+                registerLibrarySource(source, LibraryOrigin.PROJECT_EXPORT)
+                indexed = true
+            }
+            output
+        } catch (error: Throwable) {
+            if (!indexed) output.delete()
+            throw error
+        }
     }
 
     private fun newOutput(name: String, extension: String): File {
