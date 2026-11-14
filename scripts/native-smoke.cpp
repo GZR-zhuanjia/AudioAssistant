@@ -28,12 +28,15 @@ int main(int argc, char **argv) {
     awf.read(magic, 4);
     assert(std::string(magic, 4) == "AWF1");
     assert(fs::file_size(output("mono.awf")) == 36 + ((264600 + 1023) / 1024) * 4);
-    extract(mono, output("transcoded.m4a"), job);
-    assert(probe(output("transcoded.m4a"), job).codec == "aac");
-    extract(output("transcoded.m4a"), output("remuxed.m4a"), job);
+    extract(mono, output("transcoded.mp3"), job);
+    const auto mp3 = probe(output("transcoded.mp3"), job);
+    assert(mp3.codec == "mp3" && mp3.sampleRate == 48000 && mp3.channels == 2);
+    assert(std::abs(mp3.durationUs - 6000000) < 100000);
+    extract(output("transcoded.mp3"), output("copied.mp3"), job);
+    assert(probe(output("copied.mp3"), job).codec == "mp3");
     if (fs::exists(output("alac.m4a"))) {
-        extract(output("alac.m4a"), output("alac-remuxed.m4a"), job);
-        assert(probe(output("alac-remuxed.m4a"), job).codec == "alac");
+        extract(output("alac.m4a"), output("alac-converted.mp3"), job);
+        assert(probe(output("alac-converted.mp3"), job).codec == "mp3");
     }
     Export project;
     project.songs = {
@@ -69,6 +72,16 @@ int main(int argc, char **argv) {
     assert(cacheSnapshot().size() == countBeforeEdit + 1); // Only the edited song is remeasured.
     project.normalize = false;
     exportProject(project, output("plain.m4a"), root.string(), job);
+    // A converted library asset feeds the same segment/export pipeline directly.
+    project.songs = {{output("transcoded.mp3"), {{0, 1000000}, {2000000, 4000000}}, 0.0}};
+    exportProject(project, output("library-concatenated.m4a"), root.string(), job);
+    assert(std::abs(probe(output("library-concatenated.m4a"), job).durationUs - 3000000) < 30000);
+    Job cancelConversion;
+    cancelConversion.progress = [&](double progress) { if (progress > 0.70) cancelConversion.cancelled = true; };
+    bool conversionCancelled = false;
+    try { extract(mono, output("cancelled.mp3"), cancelConversion); }
+    catch (const Cancelled &) { conversionCancelled = true; }
+    assert(conversionCancelled && !fs::exists(output("cancelled.mp3")));
     project.normalize = true;
     project.songs = {{silence, {{0, 4000000}}, 0}};
     exportProject(project, output("silent.m4a"), root.string(), job);
@@ -86,5 +99,5 @@ int main(int argc, char **argv) {
     try { probe(output("broken.wav"), job); }
     catch (const std::exception &) { failed = true; }
     assert(failed);
-    std::cout << "PASS: probe, waveform, transcode, AAC remux, multi-segment multi-song loudnorm, cache hit/recovery/invalidation, silence, gain/fade, duration, cancellation/cleanup, invalid input\n";
+    std::cout << "PASS: probe, waveform, true MP3 encode/copy, converted asset direct concatenation, multi-segment multi-song loudnorm, cache hit/recovery/invalidation, silence, gain/fade, duration, conversion/export cancellation cleanup, invalid input\n";
 }

@@ -241,7 +241,7 @@ int64_t decodeSegment(const std::string &path, const Segment &segment, File &out
         job.check();
         if (frame->sample_rate <= 0) throw std::runtime_error("Invalid decoded sample rate");
         if (seekUs > 0 && frame->best_effort_timestamp == AV_NOPTS_VALUE && !sawTimestamp)
-            throw std::runtime_error("This source has no seek timestamps; extract it to M4A before trimming");
+            throw std::runtime_error("This source has no seek timestamps; convert it to MP3 before trimming");
         sawTimestamp |= frame->best_effort_timestamp != AV_NOPTS_VALUE;
         int64_t beginUs = frameTimeUs(input, frame, fallbackUs);
         fallbackUs = beginUs + av_rescale_q(frame->nb_samples, {1, frame->sample_rate}, kMicros);
@@ -547,9 +547,114 @@ struct AacWriter {
         check(av_write_trailer(format), "Finalize M4A", job);
     }
 };
-void encodePcm(const std::vector<std::string> &paths, const std::string &outputPath, Job &job,
-               const std::function<void(double)> &progress) {
-    AacWriter writer(outputPath, job);
+// The conversion target is MP3; engineering project export remains AAC/M4A.
+// Query LAME's supported PCM formats instead of assuming the AAC planar format.
+struct Mp3Writer {
+    AVFormatContext *format{};
+    AVCodecContext *encoder{};
+    AVStream *stream{};
+    int64_t pts{};
+    Job &job;
+    explicit Mp3Writer(const std::string &path, Job &job) : job(job) {
+        try {
+            const AVCodec *codec = avcodec_find_encoder_by_name("libmp3lame");
+            if (!codec) throw std::runtime_error("libmp3lame encoder unavailable; rebuild the native FFmpeg dependencies with LAME");
+            check(avformat_alloc_output_context2(&format, nullptr, "mp3", path.c_str()), "Create MP3 output", job);
+            if (!format) throw std::bad_alloc();
+            format->interrupt_callback = {interrupted, &job};
+            encoder = avcodec_alloc_context3(codec);
+            if (!encoder) throw std::bad_alloc();
+            encoder->sample_rate = kRate;
+            encoder->ch_layout = stereoLayout();
+            encoder->bit_rate = kBitRate;
+            encoder->time_base = kSamples;
+            const void *configuration = nullptr;
+            int count = 0;
+            check(avcodec_get_supported_config(encoder, codec, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0,
+                                               &configuration, &count), "Query MP3 sample formats", job);
+            const auto *formats = static_cast<const AVSampleFormat *>(configuration);
+            auto supports = [&](AVSampleFormat candidate) {
+                if (!formats) return true;
+                return std::find(formats, formats + count, candidate) != formats + count;
+            };
+            if (supports(AV_SAMPLE_FMT_FLTP)) encoder->sample_fmt = AV_SAMPLE_FMT_FLTP;
+            else if (supports(AV_SAMPLE_FMT_S16P)) encoder->sample_fmt = AV_SAMPLE_FMT_S16P;
+            else throw std::runtime_error("libmp3lame exposes no supported float or signed-16 planar format");
+            check(avcodec_open2(encoder, codec, nullptr), "Open libmp3lame encoder", job);
+            stream = avformat_new_stream(format, nullptr);
+            if (!stream) throw std::bad_alloc();
+            stream->time_base = encoder->time_base;
+            // This copies encoder initial_padding. Packet skip-sample side data
+            // is retained below so the MP3 muxer can write LAME delay/padding.
+            check(avcodec_parameters_from_context(stream->codecpar, encoder), "Configure MP3 track", job);
+            check(avio_open2(&format->pb, path.c_str(), AVIO_FLAG_WRITE,
+                             &format->interrupt_callback, nullptr), "Open MP3 output", job);
+            AVDictionary *options = nullptr;
+            av_dict_set(&options, "write_xing", "1", 0);
+            av_dict_set(&options, "id3v2_version", "3", 0);
+            int result = avformat_write_header(format, &options);
+            av_dict_free(&options);
+            check(result, "Write MP3 header", job);
+        } catch (...) { cleanup(); throw; }
+    }
+    ~Mp3Writer() { cleanup(); }
+    void cleanup() {
+        avcodec_free_context(&encoder);
+        if (format) { avio_closep(&format->pb); avformat_free_context(format); format = nullptr; }
+    }
+    int frameSize() const { return encoder->frame_size > 0 ? encoder->frame_size : 1152; }
+    void drain() {
+        Packet packet;
+        while (true) {
+            job.check();
+            int result = avcodec_receive_packet(encoder, packet.value);
+            if (result == AVERROR(EAGAIN) || result == AVERROR_EOF) return;
+            check(result, "Receive MP3 packet", job);
+            av_packet_rescale_ts(packet.value, encoder->time_base, stream->time_base);
+            packet.value->stream_index = stream->index;
+            check(av_interleaved_write_frame(format, packet.value), "Write MP3 packet", job);
+            av_packet_unref(packet.value);
+        }
+    }
+    void push(const float *interleaved, int count) {
+        Frame frame;
+        frame.value->format = encoder->sample_fmt;
+        frame.value->sample_rate = encoder->sample_rate;
+        check(av_channel_layout_copy(&frame.value->ch_layout, &encoder->ch_layout), "Set MP3 channel layout", job);
+        frame.value->nb_samples = count;
+        frame.value->pts = pts;
+        check(av_frame_get_buffer(frame.value, 0), "Allocate MP3 frame", job);
+        for (int ch = 0; ch < kChannels; ++ch) {
+            for (int i = 0; i < count; ++i) {
+                float value = interleaved[size_t(i) * kChannels + ch];
+                if (!std::isfinite(value)) throw std::runtime_error("Non-finite decoded audio sample");
+                if (encoder->sample_fmt == AV_SAMPLE_FMT_FLTP)
+                    reinterpret_cast<float *>(frame.value->data[ch])[i] = value;
+                else {
+                    long quantized = std::lround(std::clamp(double(value), -1.0, 1.0) * 32768.0);
+                    reinterpret_cast<int16_t *>(frame.value->data[ch])[i] = int16_t(std::clamp<long>(quantized, -32768, 32767));
+                }
+            }
+        }
+        // libmp3lame advertises SMALL_LAST_FRAME: send the true final sample
+        // count and flush, allowing the encoder to report its actual padding.
+        check(avcodec_send_frame(encoder, frame.value), "Encode MP3 frame", job);
+        pts += count;
+        drain();
+    }
+    void finish() {
+        check(avcodec_send_frame(encoder, nullptr), "Flush libmp3lame encoder", job);
+        drain();
+        // Seekable local output lets the muxer patch Xing length and LAME
+        // delay/end-padding fields; merely closing the file would lose these.
+        check(av_write_trailer(format), "Finalize MP3", job);
+    }
+};
+
+template<typename Writer>
+void encodePcmWith(const std::vector<std::string> &paths, const std::string &outputPath, Job &job,
+                   const std::function<void(double)> &progress) {
+    Writer writer(outputPath, job);
     int64_t total = 0;
     for (const auto &path : paths) total += pcmFrames(path);
     int64_t sent = 0;
@@ -570,11 +675,19 @@ void encodePcm(const std::vector<std::string> &paths, const std::string &outputP
     writer.finish();
     progress(1.0);
 }
-void remuxAudio(Input &input, const std::string &outputPath, Job &job) {
+void encodePcm(const std::vector<std::string> &paths, const std::string &outputPath, Job &job,
+               const std::function<void(double)> &progress) {
+    encodePcmWith<AacWriter>(paths, outputPath, job, progress);
+}
+void encodeMp3Pcm(const std::vector<std::string> &paths, const std::string &outputPath, Job &job,
+                  const std::function<void(double)> &progress) {
+    encodePcmWith<Mp3Writer>(paths, outputPath, job, progress);
+}
+void remuxMp3(Input &input, const std::string &outputPath, Job &job) {
     AVFormatContext *output = nullptr;
     auto cleanup = [&]() { if (output) { if (!(output->oformat->flags & AVFMT_NOFILE)) avio_closep(&output->pb); avformat_free_context(output); output = nullptr; } };
     try {
-        check(avformat_alloc_output_context2(&output, nullptr, "ipod", outputPath.c_str()), "Create extracted M4A", job);
+        check(avformat_alloc_output_context2(&output, nullptr, "mp3", outputPath.c_str()), "Create extracted MP3", job);
         if (!output) throw std::bad_alloc();
         output->interrupt_callback = {interrupted, &job};
         AVStream *stream = avformat_new_stream(output, nullptr);
@@ -582,15 +695,17 @@ void remuxAudio(Input &input, const std::string &outputPath, Job &job) {
         check(avcodec_parameters_copy(stream->codecpar, input.stream()->codecpar), "Copy compatible audio stream", job);
         stream->codecpar->codec_tag = 0;
         stream->time_base = input.stream()->time_base;
-        check(avio_open2(&output->pb, outputPath.c_str(), AVIO_FLAG_WRITE, &output->interrupt_callback, nullptr), "Open extracted M4A", job);
+        check(avio_open2(&output->pb, outputPath.c_str(), AVIO_FLAG_WRITE, &output->interrupt_callback, nullptr), "Open extracted MP3", job);
         AVDictionary *options = nullptr;
-        av_dict_set(&options, "movflags", "+faststart", 0);
+        av_dict_set(&options, "write_xing", "1", 0);
+        av_dict_set(&options, "id3v2_version", "3", 0);
         int headerResult = avformat_write_header(output, &options);
         av_dict_free(&options);
-        check(headerResult, "Write extracted M4A header", job);
+        check(headerResult, "Write extracted MP3 header", job);
         Packet packet;
         int64_t offset = input.stream()->start_time;
         int64_t duration = input.durationUs();
+        int64_t packetCount = 0;
         while (true) {
             job.check();
             int result = av_read_frame(input.format, packet.value);
@@ -606,13 +721,15 @@ void remuxAudio(Input &input, const std::string &outputPath, Job &job) {
                 av_packet_rescale_ts(packet.value, input.stream()->time_base, stream->time_base);
                 packet.value->stream_index = stream->index;
                 packet.value->pos = -1;
-                check(av_interleaved_write_frame(output, packet.value), "Remux compatible audio packet", job);
+                check(av_interleaved_write_frame(output, packet.value), "Remux compatible MP3 packet", job);
+                ++packetCount;
                 if (current != AV_NOPTS_VALUE && duration > 0)
                     job.report(double(av_rescale_q(current - (offset == AV_NOPTS_VALUE ? 0 : offset), input.stream()->time_base, kMicros)) / double(duration));
             }
             av_packet_unref(packet.value);
         }
-        check(av_write_trailer(output), "Finalize extracted M4A", job);
+        if (!packetCount) throw std::runtime_error("No decodable audio found in source");
+        check(av_write_trailer(output), "Finalize extracted MP3", job);
         cleanup();
     } catch (...) { cleanup(); throw; }
 }
@@ -697,16 +814,18 @@ void extract(const std::string &path, const std::string &outputPath, Job &job) {
     RemoveOnFailure cleanup{outputPath};
     Input input(path, job);
     const auto *parameters = input.stream()->codecpar;
-    // Raw ADTS AAC needs aac_adtstoasc bitstream filtering. Inputs with AAC
-    // AudioSpecificConfig already present are directly compatible with M4A.
-    const AVOutputFormat *m4a = av_guess_format("ipod", nullptr, nullptr);
-    bool copyableCodec = parameters->codec_id == AV_CODEC_ID_AAC || parameters->codec_id == AV_CODEC_ID_ALAC;
-    bool canRemux = m4a && copyableCodec && parameters->extradata_size > 0
-        && parameters->sample_rate > 0 && parameters->ch_layout.nb_channels > 0
-        && avformat_query_codec(m4a, parameters->codec_id, FF_COMPLIANCE_NORMAL) > 0;
+    const AVOutputFormat *mp3 = av_guess_format("mp3", nullptr, nullptr);
+    if (!mp3) throw std::runtime_error("FFmpeg MP3 muxer unavailable; rebuild the native FFmpeg dependencies");
+    bool canRemux = parameters->codec_id == AV_CODEC_ID_MP3 && parameters->sample_rate > 0
+        && parameters->ch_layout.nb_channels >= 1 && parameters->ch_layout.nb_channels <= 2
+        && avformat_query_codec(mp3, parameters->codec_id, FF_COMPLIANCE_NORMAL) > 0;
     if (canRemux) {
-        remuxAudio(input, outputPath, job);
+        // Keep compressed packets and their gapless skip-sample side data.
+        remuxMp3(input, outputPath, job);
     } else {
+        // Fail before decoding when the required actual MP3 encoder is missing.
+        if (!avcodec_find_encoder_by_name("libmp3lame"))
+            throw std::runtime_error("libmp3lame encoder unavailable; rebuild the native FFmpeg dependencies with LAME");
         std::string parent = std::filesystem::path(outputPath).parent_path().string();
         if (parent.empty()) parent = ".";
         Scratch scratch(parent);
@@ -720,13 +839,13 @@ void extract(const std::string &path, const std::string &outputPath, Job &job) {
             auto samples = resampler->convert(frame, 0, frame->nb_samples);
             file.write(samples.data(), samples.size() * sizeof(float));
             frames += samples.size() / kChannels;
-            if (input.durationUs() > 0) job.report(0.65 * double(frames) / kRate * 1000000.0 / double(input.durationUs()));
+            if (input.durationUs() > 0) job.report(std::min(0.65, 0.65 * double(frames) / kRate * 1000000.0 / double(input.durationUs())));
             return true;
         });
         if (!resampler) throw std::runtime_error("No decodable audio found in source");
         while (true) { auto tail = resampler->convert(nullptr, 0, 0); if (tail.empty()) break; file.write(tail.data(), tail.size() * sizeof(float)); }
         file.flush();
-        encodePcm({pcm}, outputPath, job, [&](double value) { job.report(0.65 + 0.35 * value); });
+        encodeMp3Pcm({pcm}, outputPath, job, [&](double value) { job.report(0.65 + 0.35 * value); });
     }
     job.report(1.0);
     cleanup.complete = true;

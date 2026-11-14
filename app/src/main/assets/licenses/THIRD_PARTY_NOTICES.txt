@@ -12,9 +12,27 @@ SHA-256: 733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1
 The corresponding source, build script and configuration records must accompany
 each binary release as described in docs/FFMPEG_LICENSES.md in the app source.
 
+MP3 encoding uses LAME 3.100 (https://lame.sourceforge.io/), copyright (c)
+The LAME Project, Mark Taylor, Mike Cheng and the contributors identified in
+the source files. LAME's encoder library is licensed under the GNU Library
+General Public License version 2 or later (LGPL 2.0+). Its original COPYING,
+LICENSE and README are preserved as LAME-LGPL-2.0.txt, LAME-LICENSE.txt and
+LAME-README.txt in this directory. LAME is built encode-only: its command-line
+frontends and bundled mpg123 decoder are disabled. The PIC static encoder
+library is linked inside FFmpeg's libavcodec.so; there is no extra LAME .so.
+The combined FFmpeg shared library retains its LGPL 2.1-or-later license.
+
+Official LAME source:
+https://downloads.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz
+SHA-256: ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e
+Each binary release must provide the corresponding LAME source, build scripts,
+configuration and relinking materials alongside the FFmpeg materials above.
+
 Recipients may replace the FFmpeg shared libraries and rebuild and sign this
 application from its source. Reverse engineering needed to debug modifications
-to the LGPL libraries is permitted. FFmpeg is provided without warranty.
+to the LGPL libraries is permitted. LAME can be modified and rebuilt into the
+FFmpeg library using the included sources and build scripts. FFmpeg and LAME
+are provided without warranty.
 
 This application also uses AndroidX/Jetpack Compose/Media3, Kotlin and kotlinx
 libraries under their respective Apache License 2.0 terms. Their source and

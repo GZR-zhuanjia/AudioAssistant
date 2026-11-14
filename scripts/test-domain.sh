@@ -41,6 +41,7 @@ done < "$SCRIPT_DIR/jvm-test-tools.lock"
 BUILD_DIR="$(mktemp -d "$TOOLS_DIR/classes.XXXXXX")"
 trap 'rm -rf -- "$BUILD_DIR"' EXIT
 sources=("$PROJECT_DIR"/app/src/main/java/com/audioassistant/domain/*.kt)
+sources+=("$PROJECT_DIR"/app/src/main/java/com/audioassistant/data/AudioLibraryStore.kt)
 tests=("$PROJECT_DIR"/app/src/test/java/com/audioassistant/domain/*Test.kt)
 classes=()
 for test in "${tests[@]}"; do

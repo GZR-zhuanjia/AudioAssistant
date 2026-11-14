@@ -25,6 +25,8 @@ bash scripts/build-ffmpeg.sh
 
 脚本固定官方 FFmpeg 7.1.1 和源码 SHA-256，输出 `app/src/main/ffmpeg/arm64-v8a/include`、`lib`。不要添加 GPL/nonfree 编解码器或网络协议。构建日志、configure 参数、源代码及许可证必须按 `docs/FFMPEG_LICENSES.md` 的要求随分发保留。脚本生成的 ELF 需要在本地检查 LOAD alignment 和 Android SONAME，不可仅依靠链接参数推定合规。
 
+MP3 转换依赖脚本锁定并构建的 LAME 3.100 编码器。更新源码后需要重新运行 FFmpeg 构建脚本，旧的仅 AAC 库不具备 MP3 编码能力。脚本也保留 LAME 对应源码、配置和静态链接材料，见许可说明。
+
 应用 compile/min/target SDK 均为 36。NDK r28c 的最高 Native API 为 35，FFmpeg 脚本因此使用 `aarch64-linux-android35-clang`，AGP 的 Native 配置会自动把 36 选择到工具链上限 35，无需手工覆盖 `ANDROID_PLATFORM`。这不会降低应用的安装最低版本。已核对官方 NDK `meta/platforms.json` 和 AGP 8.10.1 源码 `PlatformConfigurator.kt` 的 clamp 行为；不要将脚本改成不存在的 android36-clang。
 
 ## 无 APK 的检查
@@ -41,7 +43,7 @@ git diff --check
 
 1. 先生成 FFmpeg 库，再 Gradle Sync，检查 Kotlin/Compose、Media3 和所有 JNI 签名是否匹配；编译 Debug。此操作只能在本地允许构建的环境执行。
 2. 用 Android 16 arm64 真机运行，检查边到边布局、系统浅色/深色模式、竖屏、返回导航、旋转和重复进入裁剪页。
-3. 录制包含 AAC 音轨的 MP4：抽取后比较流 codec、时长、听感，确认走无重编码路径。再测试非 AAC 音轨转码，以及无音轨、损坏 MP4、截断文件、空文件。
+3. 录制包含 AAC 音轨的 MP4：转换后确认 MP3 codec、时长与听感；用 MP3 输入验证直接复制路径。再检查无音轨、损坏 MP4、截断文件和空文件。
 4. 单选/批量选择文件，测试 Downloads、MediaStore、第三方 DocumentsProvider、无法持久化授权的 provider、大文件及空间不足；完成导入后撤销原 URI 权限，确认应用私有快照仍可用。
 5. 编辑 300 秒音频，依次删除 120–180 秒和 60–90 秒，检查三个保留区间、灰色删除区和最后时长；再测试恢复、仅保留、播放点分割、撤销重做、删除全部后恢复。
 6. 波形首次分析完成后重新进页面/重启，确认复用缓存。删除/破坏波形缓存后重建，缩放、横向拖动和选区不应触发完整解码。测试长音频的内存占用。
@@ -56,6 +58,7 @@ git diff --check
 15. 检查 APK 中所有 `.so`（包括 `libc++_shared.so`）的 16 KB ELF 段及 zip 对齐，在 16 KB 页 Android 16 设备/模拟器验证。官方检查方法：https://developer.android.com/guide/practices/page-sizes 。
 16. 拖动排序：导入至少 10 首歌曲，长按左侧 `≡`，测试首尾互换、一次跨过多首、快速反向拖动，以及手指停在上下边缘的自动滚动。列表已滚动时拖动首个可见歌曲，视口不应跳走；滚动/点击卡片不应误触排序。松手后校验列表编号、拼接试听/导出顺序及重开项目后的顺序。拖动中按返回、切换模块或中断手势应恢复原顺序；处理任务进行中不能开始排序。上下移动按钮应保持可用。以上触摸行为仍待实机验证。
 17. 系统相册导入：在「视频提取」选择「相册导入」，确认系统 Photo Picker 仅显示视频，支持单选与多选录屏；取消不增加或清空已有任务；图片不会进入队列。返回时检查名称、批量提取和输出可播放；未提供名称时应显示「导入文件」。处理过程中两个导入按钮均禁用。拒绝/撤销访问、无法读取的相册来源、无音轨视频及空间不足应报错。确认没有整库相册/广泛存储权限弹窗，已完成的私有副本在原视频删除后仍可处理；文件导入和歌曲导入继续可用。相册交互与厂商提供程序兼容性需 Android 16 实机验证。
+18. MP3/素材库：相册选录屏，转换后检查真实 MP3 codec/容器、扩展名和 MIME；验证 48 kHz/192 kbps 转码及已有 MP3 直接复制。重开应用，从库中按勾选顺序添加、裁剪、拖动排序和导出；确认无需再次选文件。验证同内容去重、旧 M4A 输出登记、移除记录后重启不复现且已有项目仍能播放、底层音频缺失和库 JSON 损坏明确报错。分别检查 MP3/M4A 的 SAF 保存、系统播放、分享、音乐库 MIME，以及转换/入库完成边界的取消行为。此项仅记录本地待办，本轮收尾按用户要求未继续测试。
 
 ## 实际检查记录
 
@@ -73,12 +76,18 @@ git diff --check
 
 2026-11-14 增加系统相册视频导入：使用 Activity 1.10.1 Photo Picker 多选合约和 `VideoOnly` 过滤，复用 `content://` 暂存链路。全部 Kotlin 源码独立类型编译及 Git whitespace 检查通过；未执行 APK/AAB 构建或相册实机测试，待验证项见第 17 项。
 
-宿主机复跑（需预先构建的 FFmpeg 7.1.1 Linux 静态库源码目录，支持 WAV/PCM/AAC/ipod 和所需音频滤镜）：
+宿主机复跑（需预先构建的 FFmpeg 7.1.1 Linux 静态库源码目录，启用 libmp3lame、MP3/WAV/PCM/AAC/ipod 和所需音频滤镜）：
 
 ```bash
-FFMPEG_HOST_SOURCE=/路径/ffmpeg-7.1.1 bash scripts/test-native-host.sh
+FFMPEG_HOST_SOURCE=/路径/ffmpeg-7.1.1 LAME_HOST_PREFIX=/路径/lame-host bash scripts/test-native-host.sh
 ```
 
 脚本用 Python 标准库生成合成 WAV，用系统 FFmpeg（若存在）补充 ALAC 样本，使用 g++ 链接相同引擎，再执行断言；测试产物位置会打印。需要文件夹外的临时磁盘空间。宿主机测试不替代上方 Android Studio 和实机清单。
 
 **未执行** Android Gradle 全工程编译、Android NDK/CMake 交叉编译、APK/AAB 构建、安装、16 KB 成品检查和 Android 实机测试。未列为通过的 Android/NDK 检查均待本地完成。
+
+## MP3/素材库本轮记录
+
+停止测试指令之前已完成：60 项 JVM 测试（原 47 项及 13 项素材库测试）；宿主机真实 MP3 编码/复制、转换结果直接裁剪拼接、响度导出及取消清理；全 Kotlin 源码类型编译。LAME 官方源码锁定、许可和脚本也已补充。历史记录中的 AAC/ALAC 直接提取为 M4A 属于旧版行为，当前转换目标已改为 MP3，拼接成品仍为 AAC/M4A。
+
+收到用户「直接 push 到 main，别测试了」后，未再运行测试或构建；最新收尾修改直接提交，未经重新编译验证。Android Studio 和设备待办保留供之后本地验证，不表示已执行。

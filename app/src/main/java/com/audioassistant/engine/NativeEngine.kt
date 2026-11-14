@@ -46,6 +46,7 @@ class NativeEngine : Closeable {
         run(request("waveform", path).put("output", outputPath), onProgress)
     }
 
+    /** True MP3: copy compatible MP3 packets, otherwise encode with libmp3lame. */
     suspend fun extract(input: String, output: String, onProgress: (Double) -> Unit) {
         run(request("extract", input).put("output", output), onProgress)
     }
@@ -131,6 +132,10 @@ class NativeEngine : Closeable {
                 "文件中没有可解码的音轨，请选择包含音频的文件。"
             "Invalid data" in detail || "corrupt" in detail.lowercase() ->
                 "音频文件损坏或格式不受支持，请重新导入原始文件。"
+            "libmp3lame encoder unavailable" in detail || "MP3 muxer unavailable" in detail ->
+                "缺少 MP3 转换组件，请重新构建并打包包含 LAME 的 FFmpeg 音频库。"
+            "libmp3lame exposes no supported" in detail ->
+                "MP3 编码器不支持所需采样格式，请检查 LAME 与 FFmpeg 的构建配置。"
             "No such file" in detail -> "本地音频文件已丢失，请重新导入。"
             "Permission denied" in detail || "Operation not permitted" in detail ->
                 "无法读取或写入文件，请重新选择文件并授予访问权限。"
@@ -141,7 +146,7 @@ class NativeEngine : Closeable {
             "insufficient true-peak headroom" in detail ->
                 "正增益过高，无法保留真峰值余量，请降低该歌曲的增益。"
             "no seek timestamps" in detail ->
-                "此文件缺少可靠的定位时间戳，请先提取为 M4A 后再剪辑。"
+                "此文件缺少可靠的定位时间戳，请先转换为 MP3 后再剪辑。"
             "decoder" in detail.lowercase() || "encoder unavailable" in detail ->
                 "当前音频库不支持此编码格式，请转换文件或检查 FFmpeg 依赖。"
             "closed" in detail -> "音频引擎已关闭，请重新打开项目。"

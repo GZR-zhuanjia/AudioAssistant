@@ -53,12 +53,31 @@ song PCM files are streamed consecutively into one AAC encoder so there is no
 compressed-packet concatenation or repeated AAC priming between songs. Output
 is stereo AAC in M4A, 48 kHz, 192 kbit/s.
 
-Video extraction keeps only the best audio stream. AAC with existing
-AudioSpecificConfig and ALAC with its codec configuration are remuxed into M4A
-without encoding, after the M4A muxer confirms codec support. Other audio (including
-raw ADTS AAC that needs extra framing conversion) is decoded and encoded to
-48 kHz stereo AAC / 192 kbit/s. All output writes use explicit `ipod`/M4A
-muxing, independent of the temporary output filename extension.
+## Video conversion to MP3
+
+`NativeEngine.extract(input, output, onProgress)` keeps only the best audio
+stream and writes a real MP3 container using the explicit `mp3` muxer,
+independent of the temporary output filename extension. Compatible MP3 audio
+is copied as compressed packets, preserving its existing rate, channels,
+bitrate and gapless skip-sample side data. This path avoids another lossy
+encoding pass; metadata and the MP3 container header may be rewritten.
+
+Every other source codec, including AAC or ALAC inside an existing M4A, is
+decoded and resampled to 48 kHz stereo float PCM, then encoded with the actual
+`libmp3lame` encoder at 192 kbit/s. The encoder's supported formats are queried:
+planar float is preferred, with signed-16 planar conversion when required.
+Final partial PCM frames are sent at their true length. Encoder initial delay
+and packet skip/end-padding metadata are kept, the encoder is flushed, and
+the seekable output trailer updates Xing/LAME duration and padding fields.
+Players that ignore gapless metadata may still expose encoder delay/padding;
+container duration can include it. Waveform duration comes from decoded samples.
+
+MP3 conversion requires the `mp3` muxer and, for transcoding, FFmpeg built with
+LGPL LAME and `libmp3lame` enabled. A missing encoder produces an actionable
+error before decoding; there is no alternate codec written under an `.mp3`
+extension. Scratch PCM and incomplete outputs are removed on cancellation or
+failure. Existing M4A/AAC/ALAC sources remain readable. Engineering project
+export continues to use AAC in M4A at 48 kHz / 192 kbit/s.
 
 ## AWF1 waveform file
 

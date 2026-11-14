@@ -10,10 +10,14 @@ import android.util.AtomicFile
 import androidx.core.content.FileProvider
 import com.audioassistant.domain.AudioProject
 import com.audioassistant.domain.AudioSegment
+import com.audioassistant.domain.AudioLibraryItem
+import com.audioassistant.domain.LibraryOrigin
 import com.audioassistant.domain.SongItem
 import com.audioassistant.domain.SourceAudio
 import com.audioassistant.engine.NativeEngine
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
@@ -27,6 +31,7 @@ import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.Locale
 import kotlin.math.max
 
 data class VideoInput(val id: String, val displayName: String, val localPath: String)
@@ -53,6 +58,8 @@ class AppRepository(context: Context) : AutoCloseable {
     private val projectFile = AtomicFile(File(files, "project.json"))
     private val projectMutex = Mutex()
     private val waveformMutex = Mutex()
+    private val library = AudioLibraryStore(File(files, "audio-library"))
+    private val libraryMigration = AtomicFile(File(files, "audio-library-legacy-v1.done"))
 
     suspend fun loadProject(): AudioProject = withContext(Dispatchers.IO) {
         projectMutex.withLock {
@@ -106,7 +113,124 @@ class AppRepository(context: Context) : AutoCloseable {
             durationUs = metadata.durationUs, fingerprint = staged.digest,
             sampleRate = metadata.sampleRate, channels = metadata.channels
         )
+        registerLibrarySource(source, LibraryOrigin.AUDIO_IMPORT)
         SongItem(UUID.randomUUID().toString(), source, listOf(AudioSegment(0, source.durationUs)))
+    }
+
+    /** A converted file is already app-owned and immutable. Library songs refer
+     * directly to that file: no system picker, extra source copy or re-encoding. */
+    suspend fun listLibrary(): List<AudioLibraryItem> = withContext(Dispatchers.IO) {
+        libraryMutex.withLock {
+            migrateLegacyOutputs()
+            library.list().also { entries -> entries.forEach(::validateLibraryIdentity) }
+        }
+    }
+
+    suspend fun addLibraryAudio(id: String): SongItem = withContext(Dispatchers.IO) {
+        val item = listLibrary().firstOrNull { it.id == id }
+            ?: throw IOException("此素材已从库中移除，请重新选择")
+        validateSource(item.source)
+        require(item.source.durationUs > 0) { "素材时长无效，请重新导入" }
+        SongItem(UUID.randomUUID().toString(), item.source, listOf(AudioSegment(0, item.source.durationUs)))
+    }
+
+    suspend fun removeLibraryItem(id: String) = withContext(Dispatchers.IO) {
+        libraryMutex.withLock {
+            // Complete migration before deletion so the legacy scan cannot add
+            // a deliberately removed entry again on the next application start.
+            migrateLegacyOutputs()
+            library.remove(id)
+        }
+        // Keep audio bytes: an existing project may still reference this source.
+    }
+
+    suspend fun libraryItemForFile(file: File): AudioLibraryItem? = withContext(Dispatchers.IO) {
+        requirePrivateAudio(file)
+        val entries = listLibrary()
+        val samePath = entries.firstOrNull { File(it.source.localPath).canonicalFile == file.canonicalFile }
+        if (samePath != null) samePath else {
+            val hash = fingerprint(file)
+            entries.firstOrNull { it.source.fingerprint == hash }
+        }
+    }
+
+    private suspend fun registerLibrarySource(source: SourceAudio, origin: LibraryOrigin): AudioLibraryItem =
+        libraryMutex.withLock {
+            validateSource(source)
+            val existing = library.list().firstOrNull { it.id == source.fingerprint }
+            // If a user removed the physical source outside the app, a fresh
+            // import of the same bytes can repair the metadata's source location.
+            if (existing != null && File(existing.source.localPath).isFile) {
+                validateLibraryIdentity(existing)
+                requirePrivateAudio(File(existing.source.localPath))
+                return@withLock existing
+            }
+            val item = AudioLibraryItem(source.fingerprint, source, System.currentTimeMillis(), origin)
+            library.put(item)
+            item
+        }
+
+    private suspend fun fingerprint(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().buffered().use { input ->
+            val buffer = ByteArray(128 * 1024)
+            while (true) {
+                currentCoroutineContext().ensureActive()
+                val read = input.read(buffer)
+                if (read < 0) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+    }
+
+    private suspend fun outputSource(file: File, displayName: String = file.name, probeEngine: NativeEngine = engine): SourceAudio {
+        requirePrivateAudio(file)
+        val metadata = probeEngine.probe(file.absolutePath)
+        require(metadata.durationUs > 0) { "转换结果缺少有效时长" }
+        val hash = fingerprint(file)
+        return SourceAudio(hash, Uri.fromFile(file).toString(), file.absolutePath, displayName,
+            metadata.durationUs, hash, metadata.sampleRate, metadata.channels)
+    }
+
+    /** One-time recovery of valid MP3/M4A outputs made before the material library
+     * existed. Partial migration is idempotent; a corrupt index is never replaced. */
+    private suspend fun migrateLegacyOutputs() {
+        val existing = library.list()
+        if (libraryMigration.baseFile.exists() || File(libraryMigration.baseFile.path + ".bak").exists()) {
+            val version = libraryMigration.openRead().use { it.reader().readText() }
+            if (version.trim() != "1") throw IOException("素材库迁移记录损坏，原文件已保留")
+            return
+        }
+        val known = existing.map { it.id }.toMutableSet()
+        val candidates = outputs.listFiles().orEmpty().filter {
+            it.isFile && it.extension.lowercase(Locale.ROOT) in setOf("mp3", "m4a") && it.length() > 0
+        }.sortedBy { it.lastModified() }
+        // Migration is a separately owned analysis job: cancelling a foreground
+        // conversion must not cancel this job's probe and strand library refresh.
+        NativeEngine().use { migrationEngine -> for (file in candidates) {
+            currentCoroutineContext().ensureActive()
+            val source = try { outputSource(file, probeEngine = migrationEngine) }
+            catch (error: CancellationException) { throw error }
+            catch (error: IllegalStateException) {
+                // Do not finish migration when libraries are missing or the
+                // engine is closed: those failures can be repaired on restart.
+                val message = error.message.orEmpty()
+                if ("文件损坏" in message || "格式不受支持" in message || "没有可解码的音轨" in message) continue
+                throw error
+            }
+            catch (error: IllegalArgumentException) {
+                if (error.message == "转换结果缺少有效时长") continue
+                throw error
+            }
+            if (source.fingerprint !in known) {
+                library.put(AudioLibraryItem(source.fingerprint, source, file.lastModified(), LibraryOrigin.LEGACY_OUTPUT))
+                known += source.fingerprint
+            }
+        } }
+        val stream = libraryMigration.startWrite()
+        try { stream.write("1".toByteArray()); libraryMigration.finishWrite(stream) }
+        catch (error: Exception) { libraryMigration.failWrite(stream); throw error }
     }
 
     suspend fun importVideo(uri: Uri): VideoInput = withContext(Dispatchers.IO) {
@@ -213,7 +337,24 @@ class AppRepository(context: Context) : AutoCloseable {
     suspend fun extract(video: VideoInput, outputName: String, onProgress: (Double) -> Unit): File =
         withContext(Dispatchers.IO) {
             require(File(video.localPath).isFile) { "输入文件丢失，请重新选择视频" }
-            createOutput(outputName) { output -> engine.extract(video.localPath, output.absolutePath, onProgress) }
+            val output = newOutput(outputName, "mp3")
+            var indexed = false
+            try {
+                engine.extract(video.localPath, output.absolutePath, onProgress)
+                currentCoroutineContext().ensureActive()
+                // Publication is an atomic UI-independent finish step. Once a
+                // library record exists, late coroutine cancellation must never
+                // delete its audio and leave a persistent dangling reference.
+                withContext(NonCancellable) {
+                    val source = outputSource(output, "${outputBase(outputName)}.mp3")
+                    registerLibrarySource(source, LibraryOrigin.VIDEO_CONVERSION)
+                    indexed = true
+                }
+                output
+            } catch (error: Throwable) {
+                if (!indexed) output.delete()
+                throw error
+            }
         }
 
     suspend fun export(project: AudioProject, onProgress: (Double) -> Unit): File = withContext(Dispatchers.IO) {
@@ -226,22 +367,52 @@ class AppRepository(context: Context) : AutoCloseable {
     }
 
     private suspend fun createOutput(name: String, process: suspend (File) -> Unit): File {
-        val cleaned = name.removeSuffix(".m4a").replace(Regex("[\\\\/:*?\"<>|\\p{Cntrl}]"), "_").trim()
-        // Limit Unicode code points rather than UTF-16 units: never split an emoji
-        // surrogate pair when passing the same output path through JNI UTF-8.
-        val safeName = StringBuilder().apply {
-            cleaned.codePoints().limit(60).forEach { appendCodePoint(it) }
-        }.toString().ifBlank { "音频" }
-        val output = File(outputs, "$safeName-${UUID.randomUUID().toString().take(8)}.m4a")
+        val output = newOutput(name, "m4a")
         try { process(output); return output }
         catch (e: Throwable) { output.delete(); throw e }
     }
 
+    private fun newOutput(name: String, extension: String): File {
+        val base = outputBase(name)
+        val desired = File(outputs, "$base.$extension")
+        // Reserve a new path atomically. Existing library/project assets must
+        // never be overwritten when a user converts the same filename again.
+        if (desired.createNewFile()) return desired
+        return File.createTempFile("$base--", ".$extension", outputs)
+    }
+
+    private fun outputBase(name: String): String {
+        val cleaned = name.replace(Regex("(?i)\\.(m4a|mp3)$"), "").replace(Regex("[\\\\/:*?\"<>|\\p{Cntrl}]"), "_").trim()
+        // Limit Unicode code points rather than UTF-16 units: never split an emoji
+        // surrogate pair when passing the same output path through JNI UTF-8.
+        return StringBuilder().apply {
+            cleaned.codePoints().limit(50).forEach { appendCodePoint(it) }
+        }.toString().ifBlank { "音频" }
+    }
+
     private fun validateSource(source: SourceAudio) {
+        require(source.fingerprint.matches(Regex("[0-9a-f]{64}"))) { "源文件指纹无效，请重新导入" }
         val sourceFile = File(source.localPath)
         require(sourceFile.isFile && sourceFile.length() > 0) { "${source.displayName} 的本地源文件丢失，请重新导入" }
         // App-private sources are content-addressed and are never modified by editing.
-        require(sourceFile.canonicalFile.parentFile == sources.canonicalFile) { "项目中的源文件路径不合法" }
+        requirePrivateAudio(sourceFile)
+    }
+
+    private fun validateLibraryIdentity(item: AudioLibraryItem) {
+        if (item.id != item.source.fingerprint || !item.id.matches(Regex("[0-9a-f]{64}"))) {
+            throw IOException("素材库记录的内容指纹不匹配，原始记录已保留，请先备份后修复")
+        }
+    }
+
+    private fun requirePrivateAudio(file: File) {
+        val parent = file.canonicalFile.parentFile
+        require(parent == sources.canonicalFile || parent == outputs.canonicalFile) { "素材路径不在应用音频目录中" }
+    }
+
+    fun outputMimeType(file: File): String = when (file.extension.lowercase(Locale.ROOT)) {
+        "mp3" -> "audio/mpeg"
+        "m4a", "mp4" -> "audio/mp4"
+        else -> "audio/*"
     }
 
     suspend fun saveOutput(file: File, destination: Uri) = withContext(Dispatchers.IO) {
@@ -263,7 +434,7 @@ class AppRepository(context: Context) : AutoCloseable {
         val resolver = context.contentResolver
         val values = android.content.ContentValues().apply {
             put(MediaStore.Audio.Media.DISPLAY_NAME, file.name)
-            put(MediaStore.Audio.Media.MIME_TYPE, "audio/mp4")
+            put(MediaStore.Audio.Media.MIME_TYPE, outputMimeType(file))
             put(MediaStore.Audio.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MUSIC}/AudioAssistant")
             put(MediaStore.Audio.Media.IS_PENDING, 1)
         }
@@ -281,4 +452,5 @@ class AppRepository(context: Context) : AutoCloseable {
     fun shareUri(file: File): Uri = FileProvider.getUriForFile(context, "${context.packageName}.files", file)
     fun cancel() = engine.cancel()
     override fun close() { engine.close() }
+    companion object { private val libraryMutex = Mutex() }
 }

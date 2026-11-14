@@ -9,6 +9,7 @@ import androidx.media3.common.util.UnstableApi
 import com.audioassistant.data.AppRepository
 import com.audioassistant.data.VideoInput
 import com.audioassistant.data.WaveformData
+import com.audioassistant.domain.AudioLibraryItem
 import com.audioassistant.domain.AudioProject
 import com.audioassistant.domain.ExportSettings
 import com.audioassistant.domain.SegmentEditor
@@ -35,6 +36,9 @@ import java.util.UUID
 data class VideoTask(val input: VideoInput, val outputName: String, val progress: Double = 0.0, val output: File? = null)
 data class EditorState(
     val project: AudioProject = AudioProject(UUID.randomUUID().toString(), "我的舞曲", emptyList()),
+    val library: List<AudioLibraryItem> = emptyList(),
+    val libraryLoading: Boolean = true,
+    val libraryError: String? = null,
     val ready: Boolean = false,
     val loadFailed: Boolean = false,
     val selectedSongId: String? = null,
@@ -70,11 +74,13 @@ class AudioViewModel(private val repository: AppRepository, context: Context) : 
     private var saving: Job? = null
     private var waveJob: Job? = null
     private var waveGeneration = 0
+    private var libraryGeneration = 0
     private val persistenceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var persistenceEnabled = false
     private val preview = PreviewController(context.applicationContext) { message -> mutable.update { it.copy(error = message) } }
     init {
         restoreProject()
+        refreshLibrary()
         viewModelScope.launch { while (true) { val position = preview.position(); mutable.update { it.copy(preview = position, sourceCursorUs = if (position.songId == it.selectedSongId && position.songId != null) position.sourceUs else it.sourceCursorUs) }; delay(80) } }
     }
     fun restoreProject() {
@@ -92,6 +98,51 @@ class AudioViewModel(private val repository: AppRepository, context: Context) : 
                 persistenceEnabled = false
                 mutable.update { it.copy(ready = true, loadFailed = true, error = e.message ?: "项目恢复失败", saveStatus = "自动保存已暂停，原项目已保留") }
             }
+        }
+    }
+    fun refreshLibrary() {
+        val generation = ++libraryGeneration
+        viewModelScope.launch {
+            mutable.update { it.copy(libraryLoading = true, libraryError = null) }
+            try {
+                val items = repository.listLibrary()
+                if (generation == libraryGeneration) mutable.update { it.copy(library = items, libraryLoading = false) }
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) { if (generation == libraryGeneration) mutable.update { it.copy(libraryLoading = false, libraryError = e.message ?: "素材库读取失败") } }
+            finally { if (generation == libraryGeneration) mutable.update { it.copy(libraryLoading = false) } }
+        }
+    }
+    private suspend fun appendLibraryItems(ids: List<String>, onAdded: () -> Unit) {
+        val added = mutableListOf<SongItem>()
+        val errors = mutableListOf<String>()
+        ids.forEach { id ->
+            try { added += repository.addLibraryAudio(id) }
+            catch (e: CancellationException) { throw e }
+            catch (e: Exception) { errors += e.message ?: "素材无法添加" }
+        }
+        if (added.isNotEmpty()) {
+            added.forEach { histories[it.id] = SongHistory(it) }
+            projectChanged(mutable.value.project.copy(songs = mutable.value.project.songs + added))
+            selectSong(added.first().id, analyze = false)
+            mutable.update { it.copy(notice = "已按所选顺序添加 ${added.size} 个素材，可继续拖动排序", error = errors.takeIf { list -> list.isNotEmpty() }?.joinToString("\n")) }
+            onAdded()
+        } else if (errors.isNotEmpty()) mutable.update { it.copy(error = errors.joinToString("\n")) }
+    }
+    fun addLibraryItems(ids: List<String>, onAdded: () -> Unit) {
+        if (ids.isEmpty() || !persistenceEnabled || mutable.value.loadFailed) return
+        runOperation("正在从素材库添加") { appendLibraryItems(ids, onAdded) }
+    }
+    fun addConvertedOutput(file: File, onAdded: () -> Unit) {
+        if (!persistenceEnabled || mutable.value.loadFailed) return
+        runOperation("正在添加转换结果") {
+            val item = repository.libraryItemForFile(file) ?: throw IllegalStateException("转换结果未在素材库中找到，请刷新素材库后重试")
+            appendLibraryItems(listOf(item.id), onAdded)
+        }
+    }
+    fun removeLibraryItem(id: String) {
+        runOperation("正在移除素材记录") {
+            repository.removeLibraryItem(id)
+            mutable.update { it.copy(notice = "已从素材库移除记录；音频文件及项目中的歌曲保留") }
         }
     }
     private fun projectChanged(project: AudioProject) {
@@ -138,7 +189,7 @@ class AudioViewModel(private val repository: AppRepository, context: Context) : 
                 }
                 if (failed.isNotEmpty()) mutable.update { it.copy(error = failed.joinToString("\n")) }
             } catch (_: CancellationException) { }
-            finally { mutable.update { it.copy(busy = null) }; analyzeSelected() }
+            finally { mutable.update { it.copy(busy = null) }; refreshLibrary(); analyzeSelected() }
         }
     }
     fun importVideos(uris: List<Uri>) {
@@ -168,7 +219,7 @@ class AudioViewModel(private val repository: AppRepository, context: Context) : 
             val file = repository.extract(row.input, row.outputName) { progress ->
                 mutable.update { it.copy(progress = progress, videos = it.videos.map { v -> if (v.input.id == id) v.copy(progress = progress) else v }) }
             }
-            mutable.update { it.copy(videos = it.videos.map { v -> if (v.input.id == id) v.copy(output = file, progress = 1.0) else v }, notice = "音轨提取完成") }
+            mutable.update { it.copy(videos = it.videos.map { v -> if (v.input.id == id) v.copy(output = file, progress = 1.0) else v }, notice = "MP3 转换完成，已存入素材库。可手动添加到拼接。") }
         }
     }
     fun extractAll() {
@@ -186,7 +237,7 @@ class AudioViewModel(private val repository: AppRepository, context: Context) : 
                 } catch (e: CancellationException) { throw e }
                 catch (e: Exception) { errors += "${row.input.displayName}：${e.message}" }
             }
-            mutable.update { it.copy(progress = 1.0, notice = "批量提取完成", error = errors.takeIf { list -> list.isNotEmpty() }?.joinToString("\n")) }
+            mutable.update { it.copy(progress = 1.0, notice = "批量 MP3 转换完成，成功结果已存入素材库", error = errors.takeIf { list -> list.isNotEmpty() }?.joinToString("\n")) }
         }
     }
     fun export() {
@@ -200,6 +251,7 @@ class AudioViewModel(private val repository: AppRepository, context: Context) : 
     fun saveOutput(file: File, uri: Uri) = runOperation("正在保存文件") { repository.saveOutput(file, uri); mutable.update { it.copy(notice = "文件已保存") } }
     fun saveToMusic(file: File) = runOperation("正在保存到音乐库") { repository.saveToMusic(file); mutable.update { it.copy(notice = "已保存到音乐库的 AudioAssistant 文件夹") } }
     fun shareUri(file: File): Uri = repository.shareUri(file)
+    fun outputMimeType(file: File): String = repository.outputMimeType(file)
     private fun runOperation(label: String, videoId: String? = null, block: suspend () -> Unit) {
         if (mutable.value.busy != null) return
         preview.pause(); waveJob?.cancel()
@@ -208,7 +260,7 @@ class AudioViewModel(private val repository: AppRepository, context: Context) : 
             try { block() }
             catch (_: CancellationException) { }
             catch (e: Exception) { mutable.update { it.copy(error = e.message ?: "操作失败") } }
-            finally { mutable.update { it.copy(busy = null, activeVideoId = null) }; analyzeSelected() }
+            finally { mutable.update { it.copy(busy = null, activeVideoId = null) }; refreshLibrary(); analyzeSelected() }
         }
     }
     fun cancel() { repository.cancel(); operation?.cancel(); mutable.update { it.copy(notice = "已取消操作") } }

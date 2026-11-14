@@ -3,6 +3,7 @@ set -euo pipefail
 # Uses an already configured/built Linux host FFmpeg 7.1.1 tree. No NDK/Gradle/APK.
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 FFMPEG_HOST_SOURCE="${FFMPEG_HOST_SOURCE:?Set FFMPEG_HOST_SOURCE to built official FFmpeg 7.1.1 source tree}"
+LAME_HOST_PREFIX="${LAME_HOST_PREFIX:?Set LAME_HOST_PREFIX to the static PIC LAME 3.100 host installation}"
 TEST_WORK="${TEST_WORK:-$(mktemp -d)}"
 mkdir -p "$TEST_WORK"
 python3 - "$TEST_WORK" <<'PY'
@@ -30,6 +31,6 @@ g++ -std=c++17 -O1 -Wall -Wextra -Wpedantic \
     "$FFMPEG_HOST_SOURCE/libavcodec/libavcodec.a" \
     "$FFMPEG_HOST_SOURCE/libswresample/libswresample.a" \
     "$FFMPEG_HOST_SOURCE/libavutil/libavutil.a" \
-    -Wl,--end-group -lm -lpthread -o "$TEST_WORK/native-smoke"
+    -Wl,--end-group "$LAME_HOST_PREFIX/lib/libmp3lame.a" -lm -lpthread -o "$TEST_WORK/native-smoke"
 "$TEST_WORK/native-smoke" "$TEST_WORK"
 printf 'Host test artifacts: %s\n' "$TEST_WORK"
