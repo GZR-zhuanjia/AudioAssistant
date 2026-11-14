@@ -124,7 +124,7 @@ class AppRepository(context: Context) : AutoCloseable {
             resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
                 if (it.moveToFirst()) it.getString(0) else null
             }
-        } catch (_: Exception) { null } ?: "导入音频"
+        } catch (_: Exception) { null } ?: "导入文件"
         if (uri.scheme == "content") {
             try { resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
             catch (_: SecurityException) { /* Snapshot remains usable without a persistent grant. */ }

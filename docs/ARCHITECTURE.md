@@ -15,6 +15,8 @@
 
 系统选择器提供的是 `content://` 访问能力，不能作为文件路径传给 FFmpeg。导入时以流复制到 `files/sources/<SHA-256>.media`，复制过程检查协程取消，先写临时文件再重命名。相同字节复用同一个快照。原始 URI 仅用于来源记录，后续处理不再依赖其权限，外部原文件被删除或改变不影响已导入的快照。重新导入改变后的内容会得到新的指纹。
 
+视频提供相册和文件两个入口：`PickMultipleVisualMedia` 以 `VideoOnly` 打开系统 Photo Picker，`OpenMultipleDocuments` 以 `video/*` 打开 SAF；两者结果都调用同一个 ViewModel 导入及私有暂存流程。相册取消返回空列表，不改变任务列表。无需申请 `READ_MEDIA_VIDEO`、`READ_MEDIA_IMAGES` 或全盘访问权限；可持久化 URI 授权不可用时仍依靠已经完成的快照处理。歌曲使用 SAF `audio/*`，不通过相册选择。Photo Picker 参考：https://developer.android.com/training/data-storage/shared/photopicker 。
+
 `files/project.json` 保存最近一个项目，通过 AtomicFile 写入。读取失败必须向用户报错，保留原文件，不自动以空项目覆盖。播放位置、选区、缩放、滚动和历史栈不写入项目。撤销重做在本次进程内有效。
 
 导出保存在 `files/outputs`，再由用户保存到 SAF 选择位置或 Music/AudioAssistant 媒体库。MediaStore 先写 pending 行，完成后发布；失败删除行。分享使用 FileProvider 临时只读授权。应用不声明互联网或广泛存储访问权限。

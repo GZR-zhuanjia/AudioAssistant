@@ -8,6 +8,7 @@ import android.content.Intent
 import android.graphics.Paint
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.BackHandler
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -84,6 +85,9 @@ fun AudioAssistantApp(vm: AudioViewModel) {
     var pendingSavePath by rememberSaveable { mutableStateOf<String?>(null) }
     val audioPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments(), vm::importAudio)
     val videoPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments(), vm::importVideos)
+    // Android Photo Picker grants access only to the selected videos. The same
+    // repository import immediately snapshots their content:// streams offline.
+    val galleryPicker = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(), vm::importVideos)
     val savePicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("audio/mp4")) { uri ->
         val file = pendingSavePath?.let(::File); pendingSavePath = null
         if (uri != null && file != null) vm.saveOutput(file, uri)
@@ -146,10 +150,16 @@ fun AudioAssistantApp(vm: AudioViewModel) {
                 if (module == "video") {
                     item { Section {
                         Text("视频音轨提取", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                        Text("选择多个视频，逐个命名并提取为 M4A。提取结果可直接保存或分享。", style = MaterialTheme.typography.bodyMedium)
-                        Button(onClick = { videoPicker.launch(arrayOf("video/*")) }, enabled = state.busy == null) { Text("＋ 批量选择视频") }
+                        Text("从相册或文件中选择视频，逐个命名并提取为 M4A。支持多选，提取结果可直接保存或分享。", style = MaterialTheme.typography.bodyMedium)
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = {
+                                try { galleryPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)) }
+                                catch (error: Exception) { shareError = "无法打开系统相册，请使用文件导入：${error.message}" }
+                            }, enabled = state.busy == null, modifier = Modifier.weight(1f)) { Text("＋ 相册导入") }
+                            OutlinedButton(onClick = { videoPicker.launch(arrayOf("video/*")) }, enabled = state.busy == null, modifier = Modifier.weight(1f)) { Text("＋ 文件导入") }
+                        }
                         if (state.videos.any { it.output == null }) Button(onClick = vm::extractAll, enabled = state.busy == null && state.videos.filter { it.output == null }.all { it.outputName.isNotBlank() }) { Text("批量提取全部待处理视频") }
-                        if (state.videos.isEmpty()) EmptyHint("尚未导入视频", "支持文件选择器中的本地视频及可读取的文档来源")
+                        if (state.videos.isEmpty()) EmptyHint("尚未导入视频", "相册仅显示视频；也可从文件选择器浏览录屏、下载目录和其他文档来源")
                     } }
                     itemsIndexed(state.videos, key = { _, row -> row.input.id }) { index, row -> Section {
                         Text("${index + 1}. ${row.input.displayName}", fontWeight = FontWeight.SemiBold)
