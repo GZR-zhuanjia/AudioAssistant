@@ -7,6 +7,7 @@ import android.content.ClipData
 import android.content.Intent
 import android.graphics.Paint
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.BackHandler
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -18,9 +19,11 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
@@ -32,12 +35,18 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -62,7 +71,16 @@ fun AudioAssistantApp(vm: AudioViewModel) {
     val state by vm.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val lifecycle = LocalLifecycleOwner.current
+    val listState = rememberLazyListState()
+    val reorder = rememberSongReorderState(listState, vm::reorderSongs)
+    val songIds = state.project.songs.map { it.id }
     var module by rememberSaveable { mutableStateOf("edit") }
+    BackHandler(enabled = reorder.isDragging) { reorder.cancel() }
+    LaunchedEffect(module, state.busy, songIds) {
+        if (module != "edit" || state.busy != null) reorder.cancel()
+        else reorder.cancelIfChanged(songIds)
+    }
+    DisposableEffect(reorder) { onDispose { reorder.cancel() } }
     var pendingSavePath by rememberSaveable { mutableStateOf<String?>(null) }
     val audioPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments(), vm::importAudio)
     val videoPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments(), vm::importVideos)
@@ -98,7 +116,7 @@ fun AudioAssistantApp(vm: AudioViewModel) {
             TopAppBar(title = { Column { Text("音频助手", fontWeight = FontWeight.Bold); Text("从视频到舞曲，让每一段恰到好处", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) } },
                 actions = { Text("本地处理", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(end = 16.dp)) })
         }) { padding ->
-            LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(14.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            LazyColumn(Modifier.fillMaxSize().padding(padding), state = listState, userScrollEnabled = !reorder.isDragging, contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(14.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                 item { Row(Modifier.widthIn(max = 900.dp).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     ModuleCard("视频提取", "批量导入 · 独立音轨", module == "video", Modifier.weight(1f)) { module = "video" }
                     ModuleCard("多曲编辑", "精确裁剪 · 顺序拼接", module == "edit", Modifier.weight(1f)) { module = "edit" }
@@ -148,13 +166,16 @@ fun AudioAssistantApp(vm: AudioViewModel) {
                         Text("我的舞曲", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                             Text("${state.project.songs.size} 首 · 保留 ${timeText(state.project.songs.sumOf { SegmentEditor.editedDurationUs(it.segments) })}", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
-                            Button(onClick = { audioPicker.launch(arrayOf("audio/*")) }, enabled = state.ready && !state.loadFailed && state.busy == null) { Text("＋ 添加歌曲") }
+                            Button(onClick = { audioPicker.launch(arrayOf("audio/*")) }, enabled = state.ready && !state.loadFailed && state.busy == null && !reorder.isDragging) { Text("＋ 添加歌曲") }
                         }
                         Text(state.saveStatus, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        if (state.project.songs.size > 1) Text("长按歌曲左侧 ≡ 上下拖动排序，松手后保存；也可使用上移、下移。", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         if (state.project.songs.isEmpty()) EmptyHint("从第一首歌开始", "批量选择歌曲后，调整顺序、删掉片段，再导出一段完整舞曲")
                     } }
-                    itemsIndexed(state.project.songs, key = { _, song -> song.id }) { index, song ->
-                        SongRow(song, state.waveforms[song.source.id], index, state.project.songs.size, song.id == state.selectedSongId, state.busy == null, vm)
+                    val songById = state.project.songs.associateBy { it.id }
+                    val displayedSongs = reorder.orderedIds?.mapNotNull(songById::get) ?: state.project.songs
+                    itemsIndexed(displayedSongs, key = { _, song -> songListKey(song.id) }) { index, song ->
+                        SongRow(song, state.waveforms[song.source.id], index, state.project.songs.size, song.id == state.selectedSongId, state.busy == null, vm, reorder, songIds)
                     }
                     val selected = state.selectedSong
                     if (selected != null) {
@@ -192,24 +213,49 @@ private fun EmptyHint(title: String, description: String) {
     }
 }
 @Composable
-private fun SongRow(song: SongItem, waveform: WaveformData?, index: Int, total: Int, selected: Boolean, enabled: Boolean, vm: AudioViewModel) {
-    Surface(Modifier.widthIn(max = 900.dp).fillMaxWidth().border(if (selected) 2.dp else 0.dp, if (selected) Accent else Color.Transparent, RoundedCornerShape(16.dp)).clickable(enabled = enabled) { vm.selectSong(song.id) }, shape = RoundedCornerShape(16.dp), color = if (selected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f) else MaterialTheme.colorScheme.surface) {
+private fun SongRow(song: SongItem, waveform: WaveformData?, index: Int, total: Int, selected: Boolean, enabled: Boolean, vm: AudioViewModel, reorder: SongReorderState, songIds: List<String>) {
+    val dragging = reorder.activeId == song.id
+    val actionsEnabled = enabled && !reorder.isDragging
+    Surface(Modifier.widthIn(max = 900.dp).fillMaxWidth().zIndex(if (dragging) 1f else 0f)
+        .graphicsLayer { translationY = reorder.translationFor(song.id); if (dragging) shadowElevation = 8.dp.toPx() }
+        .border(if (selected || dragging) 2.dp else 0.dp, if (selected || dragging) Accent else Color.Transparent, RoundedCornerShape(16.dp))
+        .clickable(enabled = actionsEnabled) { vm.selectSong(song.id) }, shape = RoundedCornerShape(16.dp), color = if (selected || dragging) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f) else MaterialTheme.colorScheme.surface) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
+                SongDragHandle(song.id, song.source.displayName, reorder, songIds, enabled && total > 1)
                 Text("${index + 1}".padStart(2, '0'), Modifier.padding(end = 12.dp), color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                 Column(Modifier.weight(1f)) {
                     Text(song.source.displayName, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Text("原长 ${timeText(song.source.durationUs)} → 保留 ${timeText(SegmentEditor.editedDurationUs(song.segments))} · ${song.segments.size} 段", style = MaterialTheme.typography.labelSmall)
                 }
-                TextButton(onClick = { vm.selectSong(song.id) }, enabled = enabled) { Text(if (selected) "编辑中" else "编辑") }
+                TextButton(onClick = { vm.selectSong(song.id) }, enabled = actionsEnabled) { Text(if (selected) "编辑中" else "编辑") }
             }
             Waveform(song, waveform, 0, song.source.durationUs, 0, 0, null, Modifier.fillMaxWidth().height(30.dp), overview = true)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                TextButton(onClick = { vm.moveSong(song.id, -1) }, enabled = enabled && index > 0) { Text("上移") }
-                TextButton(onClick = { vm.moveSong(song.id, 1) }, enabled = enabled && index < total - 1) { Text("下移") }
-                TextButton(onClick = { vm.removeSong(song.id) }, enabled = enabled) { Text("移除") }
+                TextButton(onClick = { vm.moveSong(song.id, -1) }, enabled = actionsEnabled && index > 0) { Text("上移") }
+                TextButton(onClick = { vm.moveSong(song.id, 1) }, enabled = actionsEnabled && index < total - 1) { Text("下移") }
+                TextButton(onClick = { vm.removeSong(song.id) }, enabled = actionsEnabled) { Text("移除") }
             }
         }
+    }
+}
+
+@Composable
+private fun SongDragHandle(id: String, name: String, reorder: SongReorderState, songIds: List<String>, enabled: Boolean) {
+    val currentIds by rememberUpdatedState(songIds)
+    val haptics = LocalHapticFeedback.current
+    Box(Modifier.size(48.dp)
+        .semantics { contentDescription = "长按拖动排序：$name" }
+        // The key is the stable song ID, never its changing list index.
+        .pointerInput(id, enabled) {
+            if (enabled) detectDragGesturesAfterLongPress(
+                onDragStart = { if (reorder.begin(id, currentIds)) haptics.performHapticFeedback(HapticFeedbackType.LongPress) },
+                onDrag = { change, amount -> if (reorder.activeId == id) { change.consume(); reorder.dragBy(amount.y) } },
+                onDragEnd = { if (reorder.activeId == id) reorder.finish() },
+                onDragCancel = { if (reorder.activeId == id) reorder.cancel() },
+            )
+        }, contentAlignment = Alignment.Center) {
+        Text("≡", color = if (enabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f), style = MaterialTheme.typography.headlineMedium)
     }
 }
 

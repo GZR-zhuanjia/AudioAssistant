@@ -300,9 +300,21 @@ class AudioViewModel(private val repository: AppRepository, context: Context) : 
     fun undo() { mutable.value.selectedSong?.id?.let { id -> histories[id]?.let { replaceSong(it.undo()) } } }
     fun redo() { mutable.value.selectedSong?.id?.let { id -> histories[id]?.let { replaceSong(it.redo()) } } }
     fun moveSong(id: String, direction: Int) {
+        if (mutable.value.busy != null) return
         val songs = mutable.value.project.songs.toMutableList(); val index = songs.indexOfFirst { it.id == id }; val next = index + direction
         if (index < 0 || next !in songs.indices) return
         val song = songs.removeAt(index); songs.add(next, song); projectChanged(mutable.value.project.copy(songs = songs))
+    }
+    fun reorderSongs(orderedIds: List<String>) {
+        val current = mutable.value
+        if (current.busy != null || current.loadFailed) return
+        val songs = current.project.songs
+        // Reject a stale drag if another action changed the membership mid-gesture.
+        if (orderedIds.size != songs.size || orderedIds.toSet().size != songs.size ||
+            orderedIds.toSet() != songs.map { it.id }.toSet()) return
+        val byId = songs.associateBy { it.id }
+        val reordered = orderedIds.map { byId.getValue(it) }
+        if (reordered != songs) projectChanged(current.project.copy(songs = reordered))
     }
     fun removeSong(id: String) {
         preview.stop(); histories.remove(id)

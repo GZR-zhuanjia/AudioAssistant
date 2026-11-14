@@ -54,6 +54,7 @@ git diff --check
 13. SAF 保存、MediaStore 音乐库保存、系统播放和分享，在其他应用中验证 MIME、临时读取授权及音轨可读；取消系统保存器应正常返回。
 14. 杀进程/重开，检查最近项目恢复、原始文件仍未改变。损坏 project.json、删除私有源快照，确认明确报错且不默默覆盖项目。
 15. 检查 APK 中所有 `.so`（包括 `libc++_shared.so`）的 16 KB ELF 段及 zip 对齐，在 16 KB 页 Android 16 设备/模拟器验证。官方检查方法：https://developer.android.com/guide/practices/page-sizes 。
+16. 拖动排序：导入至少 10 首歌曲，长按左侧 `≡`，测试首尾互换、一次跨过多首、快速反向拖动，以及手指停在上下边缘的自动滚动。列表已滚动时拖动首个可见歌曲，视口不应跳走；滚动/点击卡片不应误触排序。松手后校验列表编号、拼接试听/导出顺序及重开项目后的顺序。拖动中按返回、切换模块或中断手势应恢复原顺序；处理任务进行中不能开始排序。上下移动按钮应保持可用。以上触摸行为仍待实机验证。
 
 ## 实际检查记录
 
@@ -66,6 +67,8 @@ git diff --check
 * 全部 Android Kotlin 源码通过**独立类型编译**：使用官方 Android 36 `android.jar`、固定版本实际 AAR/JAR classpath、Kotlin 2.1.20 和真实 Compose/Serialization 插件；没有启动 Android Gradle 资源、Native 或打包任务。这覆盖 Kotlin 类型和依赖 API，不覆盖清单合并、资源编译、DEX、Native ABI 或运行行为。
 * 引擎及 JNI 用 FFmpeg 7.1.1 和官方 OpenJDK 21 JNI 头文件执行 `g++ -std=c++17 -Wall -Wextra -Wpedantic -fsyntax-only`：通过。
 * Shell 脚本语法、XML 解析、锁定源码/Wrapper 校验值、FFmpeg 组件名称和 Git whitespace 检查：通过。
+
+2026-11-14 增加歌曲拖动排序：复用相同 API 36/Compose 依赖进行全部 Kotlin 源码的独立类型编译，并审查稳定 key、视口坐标、自动滚动和取消行为；未执行 APK/AAB 构建或触摸实机测试。实际手势验收见第 16 项。
 
 宿主机复跑（需预先构建的 FFmpeg 7.1.1 Linux 静态库源码目录，支持 WAV/PCM/AAC/ipod 和所需音频滤镜）：
 
